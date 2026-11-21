@@ -102,10 +102,7 @@ macro_rules! const_slice_sort {
                 out[i] = A[i];
                 let mut j = i;
                 while j > 0 && compare(out[j], out[j - 1]) == -1 {
-                    //swap
-                    let tmp = out[j];
-                    out[j] = out[j - 1];
-                    out[j - 1] = tmp;
+                    out.swap(j, j - 1);
 
                     j -= 1;
                 }
