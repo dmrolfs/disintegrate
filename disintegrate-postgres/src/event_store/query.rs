@@ -9,13 +9,13 @@ use sqlx::{Postgres, QueryBuilder};
 /// All values (origin, event type, identifier values) are bound as parameters.
 /// Identifier column names come from a validated schema and are interpolated
 /// directly as SQL identifiers.
-pub trait QueryBuilderExt<'a> {
+pub trait QueryBuilderExt {
     fn push_stream_query<QE>(&mut self, query: &StreamQuery<PgEventId, QE>) -> &mut Self
     where
         QE: Event + Clone;
 }
 
-impl<'a> QueryBuilderExt<'a> for QueryBuilder<'a, Postgres> {
+impl QueryBuilderExt for QueryBuilder<Postgres> {
     fn push_stream_query<QE>(&mut self, query: &StreamQuery<PgEventId, QE>) -> &mut Self
     where
         QE: Event + Clone,
@@ -150,7 +150,7 @@ mod tests {
     fn build_sql(query: &StreamQuery<PgEventId, TestEvent>) -> String {
         let mut qb = QueryBuilder::<Postgres>::new("");
         qb.push_stream_query(query);
-        qb.sql().to_string()
+        qb.sql().as_str().to_string()
     }
 
     #[test]
@@ -214,6 +214,7 @@ mod tests {
         let mut qb = QueryBuilder::<Postgres>::new("");
         qb.push_stream_query(&query);
         let sql = qb.sql();
+        let sql = sql.as_str();
         assert!(
             !sql.contains('\''),
             "value must not be inlined into the SQL, got: {sql}"

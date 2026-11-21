@@ -14,7 +14,7 @@ where
     E: Event + Clone,
     S: Serde<E>,
 {
-    builder: sqlx::QueryBuilder<'a, Postgres>,
+    builder: sqlx::QueryBuilder<Postgres>,
     events: &'a [E],
     serde: &'a S,
 }

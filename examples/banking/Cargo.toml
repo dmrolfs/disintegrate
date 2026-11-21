@@ -15,5 +15,5 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 dotenv = "0.15.0"
-sqlx = { version = "0.8.6", features = [ "runtime-tokio-rustls" , "postgres" ] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 actix-web = "4.13.0"

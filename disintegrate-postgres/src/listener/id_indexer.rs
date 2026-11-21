@@ -126,10 +126,7 @@ impl<E: Event + Clone + Send + Sync> EventListener<PgEventId, E> for PgIdIndexer
     }
 }
 
-fn sql_builder(
-    event_id: PgEventId,
-    domain_ids: DomainIdSet,
-) -> sqlx::QueryBuilder<'static, Postgres> {
+fn sql_builder(event_id: PgEventId, domain_ids: DomainIdSet) -> sqlx::QueryBuilder<Postgres> {
     let domain_ids = <BTreeMap<_, _> as Clone>::clone(&domain_ids).into_iter();
     let mut sql_builder = sqlx::QueryBuilder::new("UPDATE event SET ");
     let mut separated = sql_builder.separated(",");

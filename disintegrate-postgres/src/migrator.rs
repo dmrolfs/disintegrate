@@ -8,6 +8,7 @@
 //! dedicated administrative tooling.
 use disintegrate::{DomainIdInfo, Event};
 use disintegrate_serde::Serde;
+use sqlx::AssertSqlSafe;
 
 use crate::PgEventStore;
 
@@ -148,15 +149,17 @@ where
             disintegrate::IdentifierType::i64 => "BIGINT",
             disintegrate::IdentifierType::Uuid => "UUID",
         };
-        sqlx::query(&format!(
+        // Identifiers come from the derive-generated schema and `table` is an internal constant,
+        // so the interpolated SQL is audited.
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column_name} {sql_type}"
-        ))
+        )))
         .execute(&self.event_store.pool)
         .await?;
 
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "CREATE INDEX IF NOT EXISTS idx_{table}_{column_name} ON {table} ({column_name}) WHERE {column_name} IS NOT NULL"
-        ))
+        )))
         .execute(&self.event_store.pool)
         .await?;
         Ok(())
@@ -168,24 +171,27 @@ where
         table: &str,
         column: &str,
     ) -> Result<(), Error> {
-        let index_type: Option<String> = sqlx::query_scalar(&format!("SELECT am.amname AS index_type FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname = '{index_name}'"))
+        let index_type: Option<String> = sqlx::query_scalar("SELECT am.amname AS index_type FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname = $1")
+        .bind(index_name)
         .fetch_optional(&self.event_store.pool)
         .await?;
 
         if index_type.is_some_and(|ty| ty == "hash") {
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "CREATE INDEX IF NOT EXISTS {index_name}_tmp ON {table} ({column})"
-            ))
+            )))
             .execute(&self.event_store.pool)
             .await?;
 
-            sqlx::query(&format!("DROP INDEX CONCURRENTLY {index_name}"))
-                .execute(&self.event_store.pool)
-                .await?;
+            sqlx::query(AssertSqlSafe(format!(
+                "DROP INDEX CONCURRENTLY {index_name}"
+            )))
+            .execute(&self.event_store.pool)
+            .await?;
 
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "ALTER INDEX {index_name}_tmp RENAME TO  {index_name}"
-            ))
+            )))
             .execute(&self.event_store.pool)
             .await?;
         }
