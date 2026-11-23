@@ -80,8 +80,12 @@ impl StateSnapshotter<PgEventId> for PgSnapshotter {
             let snapshot_name: String = row.get(0);
             let snapshot_query: String = row.get(1);
             if S::NAME == snapshot_name && query == snapshot_query {
-                let payload = serde_json::from_str(row.get(2)).unwrap_or(default.into_state());
-                return StatePart::new(row.get(3), payload);
+                // An unreadable payload (for example after the state's shape or validation changed)
+                // must not be paired with the stored version: that would skip every event up to it
+                // and start from an empty state. Fall back to the default and replay from its version.
+                if let Ok(payload) = serde_json::from_str(row.get(2)) {
+                    return StatePart::new(row.get(3), payload);
+                }
             }
         }
 

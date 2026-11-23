@@ -147,3 +147,29 @@ async fn it_loads_snapshots(pool: PgPool) {
     assert_eq!(loaded_state.version(), 3);
     assert_eq!(loaded_state.into_state(), expected_state);
 }
+
+#[sqlx::test]
+async fn it_ignores_a_snapshot_whose_payload_cannot_be_deserialized(pool: PgPool) {
+    let snapshotter = PgSnapshotter::try_new(pool.clone(), 2).await.unwrap();
+    let default_state = CartState::new("c1", []);
+    let query_key = query_key(&default_state.query());
+    let snapshot_id = snapshot_id(CartState::NAME, &query_key);
+    sqlx::query("INSERT INTO snapshot (id, name, query, payload, version) VALUES ($1,$2,$3,$4,$5)")
+        .bind(snapshot_id)
+        .bind(CartState::NAME)
+        .bind(query_key)
+        .bind(r#"{"cart_id": 7}"#) // wrong shape for CartState
+        .bind(3)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let loaded_state = snapshotter
+        .load_snapshot(default_state.clone().into_state_part())
+        .await;
+
+    // Keeping the stored version with the default payload would skip events 1..=3, so the load must
+    // start again from the default state and its own version, which replays every event.
+    assert_eq!(loaded_state.version(), 0);
+    assert_eq!(loaded_state.into_state(), default_state);
+}
