@@ -1,5 +1,5 @@
 use super::append::InsertEventsBuilder;
-use crate::{Error, PgEventId, PgEventStore};
+use crate::{Error, PgEventId, PgEventStore, PgTx};
 use disintegrate::{
     domain_ids, ident, query, DomainIdInfo, DomainIdSet, Event, EventInfo, EventSchema, EventStore,
     IdentifierType,
@@ -536,4 +536,251 @@ pub async fn insert_events<E: Event + Clone + Serialize + DeserializeOwned>(
         .execute(pool)
         .await
         .unwrap();
+}
+
+type CartStore = PgEventStore<ShoppingCartEvent, Json<ShoppingCartEvent>>;
+
+async fn serializable_tx(pool: &PgPool) -> tokio::sync::Mutex<PgTx> {
+    tokio::sync::Mutex::new(
+        pool.begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .unwrap(),
+    )
+}
+
+async fn event_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM event")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn tx_store_appends_on_the_callers_transaction_and_never_commits(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+    let query = query!(ShoppingCartEvent; cart_id == "cart_1");
+
+    // Rolled back by the caller: nothing is stored, and nothing is visible before the commit.
+    let tx = serializable_tx(&pool).await;
+    let tx_store = store.in_transaction(&tx);
+    let persisted = tx_store
+        .append(vec![added_event("product_1", "cart_1")], query.clone(), 0)
+        .await
+        .unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(event_count(&pool).await, 0);
+    tx.into_inner().rollback().await.unwrap();
+    assert_eq!(event_count(&pool).await, 0);
+
+    // Committed by the caller: the event is stored.
+    let tx = serializable_tx(&pool).await;
+    store
+        .in_transaction(&tx)
+        .append(vec![added_event("product_1", "cart_1")], query, 0)
+        .await
+        .unwrap();
+    tx.into_inner().commit().await.unwrap();
+    assert_eq!(event_count(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn tx_store_shares_the_transaction_with_other_caller_writes(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE audit (note TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tx = serializable_tx(&pool).await;
+    store
+        .in_transaction(&tx)
+        .append(
+            vec![added_event("product_1", "cart_1")],
+            query!(ShoppingCartEvent; cart_id == "cart_1"),
+            0,
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO audit VALUES ('appended')")
+        .execute(&mut **tx.lock().await)
+        .await
+        .unwrap();
+    tx.into_inner().rollback().await.unwrap();
+
+    let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((event_count(&pool).await, audit), (0, 0));
+}
+
+#[sqlx::test]
+async fn tx_store_refuses_a_transaction_that_is_not_serializable(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+
+    let tx = tokio::sync::Mutex::new(pool.begin().await.unwrap());
+    sqlx::query("SELECT 1")
+        .execute(&mut **tx.lock().await)
+        .await
+        .unwrap();
+    let result = store
+        .in_transaction(&tx)
+        .append(
+            vec![added_event("product_1", "cart_1")],
+            query!(ShoppingCartEvent; cart_id == "cart_1"),
+            0,
+        )
+        .await;
+
+    assert!(matches!(result, Err(Error::Database(_))));
+    tx.into_inner().rollback().await.unwrap();
+    assert_eq!(event_count(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn tx_store_rejects_a_decision_made_before_a_matching_event_committed(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+    let query = query!(ShoppingCartEvent; cart_id == "cart_1");
+
+    let tx = serializable_tx(&pool).await;
+    let tx_store = store.in_transaction(&tx);
+    let seen = tx_store
+        .stream(&query)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let version = seen.last().map_or(0, |item| item.id());
+
+    // A validated rival commits a matching event after the caller's snapshot was taken.
+    store
+        .append(vec![added_event("product_9", "cart_1")], query.clone(), 0)
+        .await
+        .unwrap();
+
+    // The rival's event is invisible to the caller's snapshot, so the conflict is reported by
+    // PostgreSQL as a serialization failure (SQLSTATE 40001), here or at commit, not as `Concurrency`.
+    let appended = tx_store
+        .append(vec![added_event("product_1", "cart_1")], query, version)
+        .await;
+    let committed = match appended {
+        Ok(_) => tx.into_inner().commit().await.is_ok(),
+        Err(_) => false,
+    };
+
+    assert!(!committed, "the stale decision must not commit");
+    assert_eq!(event_count(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn tx_store_lets_exactly_one_of_two_overlapping_decisions_commit(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+    let query = query!(ShoppingCartEvent; cart_id == "cart_1");
+
+    let (a, b) = (serializable_tx(&pool).await, serializable_tx(&pool).await);
+    store
+        .in_transaction(&a)
+        .append(vec![added_event("product_1", "cart_1")], query.clone(), 0)
+        .await
+        .unwrap();
+    store
+        .in_transaction(&b)
+        .append(vec![added_event("product_2", "cart_1")], query, 0)
+        .await
+        .unwrap();
+    let committed = [
+        a.into_inner().commit().await.is_ok(),
+        b.into_inner().commit().await.is_ok(),
+    ];
+
+    assert_eq!(committed.iter().filter(|ok| **ok).count(), 1);
+    assert_eq!(event_count(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn tx_store_does_not_return_its_own_events_to_a_later_read(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+    let query = query!(ShoppingCartEvent; cart_id == "cart_1");
+    // An earlier committed event, so the new event's id is above the epoch marker. In an empty store
+    // the first event has the same id as the marker and a re-read does return it; callers must not
+    // rely on either behavior and should use the events returned by the append.
+    insert_events(&pool, &[added_event("product_0", "cart_1")]).await;
+
+    let tx = serializable_tx(&pool).await;
+    let tx_store = store.in_transaction(&tx);
+    tx_store
+        .append(vec![added_event("product_1", "cart_1")], query.clone(), 1)
+        .await
+        .unwrap();
+    let events = tx_store
+        .stream(&query)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|item| matches!(item, disintegrate::StreamItem::Event(_)))
+        .count();
+
+    assert_eq!(
+        events, 1,
+        "only the earlier committed event, not the new one"
+    );
+    tx.into_inner().rollback().await.unwrap();
+}
+
+#[sqlx::test]
+async fn tx_store_does_not_detect_an_unvalidated_rival_append(pool: PgPool) {
+    let store = CartStore::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+    let query = query!(ShoppingCartEvent; cart_id == "cart_1");
+
+    let tx = serializable_tx(&pool).await;
+    let tx_store = store.in_transaction(&tx);
+    let seen = tx_store
+        .stream(&query)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let version = seen.last().map_or(0, |item| item.id());
+
+    // A rival inserts a matching event without validation (and without reading) and commits.
+    store
+        .append_without_validation(vec![added_event("product_9", "cart_1")])
+        .await
+        .unwrap();
+
+    // Documented behavior: the caller's snapshot does not contain the rival's event and the rival
+    // read nothing, so PostgreSQL finds no conflict and the stale decision commits. The store's own
+    // `append`, which validates in a fresh transaction, returns `Error::Concurrency` here.
+    tx_store
+        .append(
+            vec![added_event("product_1", "cart_1")],
+            query.clone(),
+            version,
+        )
+        .await
+        .unwrap();
+    tx.into_inner().commit().await.unwrap();
+    assert_eq!(event_count(&pool).await, 2);
+
+    let own_path = store
+        .append(vec![added_event("product_2", "cart_1")], query, version)
+        .await;
+    assert!(matches!(own_path, Err(Error::Concurrency)));
 }

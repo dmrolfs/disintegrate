@@ -6,6 +6,9 @@ mod append;
 mod query;
 #[cfg(test)]
 mod tests;
+mod tx;
+
+pub use tx::{tx_decision_maker, PgTx, PgTxDecisionMaker, PgTxEventStore};
 
 use append::InsertEventsBuilder;
 use futures::stream::BoxStream;
@@ -135,6 +138,37 @@ where
             .collect::<Vec<_>>();
 
         Ok(persisted_events)
+    }
+
+    /// Inserts events within an existing transaction without validating and without committing.
+    ///
+    /// Signals an in-flight write with `event_store_begin_epoch()` first, like every other append.
+    pub(crate) async fn append_without_validation_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        events: Vec<E>,
+    ) -> Result<Vec<PersistedEvent<PgEventId, E>>, Error>
+    where
+        E: Clone,
+    {
+        sqlx::query("SELECT event_store_begin_epoch()")
+            .execute(&mut **tx)
+            .await?;
+
+        let mut insert = InsertEventsBuilder::new(&events, &self.serde);
+        let event_ids: Vec<PgEventId> = insert
+            .build()
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+
+        Ok(event_ids
+            .iter()
+            .zip(events)
+            .map(|(event_id, event)| PersistedEvent::new(*event_id, event))
+            .collect())
     }
 
     /// Streams events based on the provided query and executor.
@@ -292,24 +326,9 @@ where
     {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("SELECT event_store_begin_epoch()")
-            .execute(&mut *tx)
+        let persisted_events = self
+            .append_without_validation_in_tx(&mut tx, events)
             .await?;
-
-        let mut insert = InsertEventsBuilder::new(&events, &self.serde);
-        let event_ids: Vec<PgEventId> = insert
-            .build()
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(|r| r.get(0))
-            .collect();
-
-        let persisted_events = event_ids
-            .iter()
-            .zip(events)
-            .map(|(event_id, event)| PersistedEvent::new(*event_id, event))
-            .collect::<Vec<_>>();
 
         tx.commit().await?;
 

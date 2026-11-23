@@ -6,7 +6,9 @@ mod listener;
 mod migrator;
 mod snapshotter;
 
-pub use crate::event_store::PgEventStore;
+pub use crate::event_store::{
+    tx_decision_maker, PgEventStore, PgTx, PgTxDecisionMaker, PgTxEventStore,
+};
 #[cfg(feature = "listener")]
 pub use crate::listener::{
     id_indexer::{Error as PgIdIndexerError, PgIdIndexer},
