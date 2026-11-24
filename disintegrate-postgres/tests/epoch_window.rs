@@ -121,3 +121,49 @@ async fn a_writer_that_commits_while_the_epoch_is_computed_is_delivered(pool: Pg
         "an epoch that covers event 1 must come with event 1, or a listener checkpoints past it"
     );
 }
+
+/// A listener-shaped cursor: read everything above `cursor`, return the ids and the epoch the read ended at.
+async fn read_from(store: &PgEventStore<DomainEvent, Json<DomainEvent>>, cursor: i64) -> (Vec<i64>, i64) {
+    let query = query!(DomainEvent).change_origin(cursor);
+    let mut items = store.stream(&query);
+    let (mut seen, mut end) = (Vec::new(), cursor);
+    while let Some(item) = items.next().await {
+        match item.unwrap() {
+            StreamItem::Event(event) => seen.push(event.id()),
+            StreamItem::End(epoch) => end = epoch,
+        }
+    }
+    (seen, end)
+}
+
+async fn append_open(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT event_store_begin_epoch()").execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO event (event_type, payload, account_id) VALUES ('Deposited', $1, 1)")
+        .bind(br#"{"Deposited":{"account_id":1,"amount":1}}"#.to_vec())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}
+
+/// On a sequence that has never been used the first writer's id equals the sequence's `last_value`, so its marker must
+/// be 0, not `last_value`. Otherwise a second writer that commits id 2 lets a listener checkpoint 1 and skip event 1.
+#[sqlx::test]
+async fn the_first_event_of_a_new_database_is_not_skipped_when_a_second_writer_commits_first(pool: PgPool) {
+    let store = PgEventStore::<DomainEvent, Json<DomainEvent>>::try_new(pool.clone(), Json::default())
+        .await
+        .unwrap();
+
+    let first = append_open(&pool).await; // draws id 1 and stays open
+    let second = append_open(&pool).await; // draws id 2
+    second.commit().await.unwrap();
+
+    let (seen, cursor) = read_from(&store, 0).await;
+    first.commit().await.unwrap();
+    let (later, _) = read_from(&store, cursor).await;
+
+    let mut delivered = seen;
+    delivered.extend(later);
+    assert_eq!(delivered, vec![1, 2], "event 1 committed and must be delivered (cursor was {cursor})");
+}
