@@ -197,31 +197,37 @@ where
         query: &'a StreamQuery<PgEventId, QE>,
     ) -> BoxStream<'a, Result<StreamItem<PgEventId, QE>, Error>>
     where
-        EX: sqlx::PgExecutor<'a> + Send + Sync + 'a,
+        EX: sqlx::Acquire<'a, Database = sqlx::Postgres> + Send + Sync + 'a,
         QE: TryFrom<E> + Event + Clone + Send + Sync + 'static,
         <QE as TryFrom<E>>::Error: StdError + Send + Sync + 'static,
     {
         stream! {
+            // The epoch is computed by its own statement and the scan runs after it. In one statement the scan
+            // keeps the statement's snapshot while the epoch function takes fresh ones, so a writer that commits
+            // in between is covered by the epoch but invisible to the scan, and a listener would save a
+            // checkpoint past an event it never saw. Every writer at or below the epoch either still held its
+            // marker when the epoch was computed (so the epoch is below it) or had committed, and a commit is
+            // visible to every statement that starts afterwards.
+            let mut conn = executor.acquire().await?;
+            let epoch_id: PgEventId = sqlx::query_scalar("SELECT event_store_current_epoch()")
+                .fetch_one(&mut *conn)
+                .await?;
+
             let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-                r#"SELECT event.event_id, event.payload, epoch.__epoch_id
-            FROM (values (event_store_current_epoch())) AS epoch(__epoch_id)
-            LEFT JOIN event ON event.event_id <= epoch.__epoch_id AND ("#,
+                "SELECT event.event_id, event.payload FROM event WHERE event.event_id <= ",
             );
+            qb.push_bind(epoch_id).push(" AND (");
             qb.push_stream_query(query).push(") ORDER BY event_id ASC");
 
-            let mut rows = qb.build().fetch(executor);
-            let mut epoch_id: PgEventId = 0;
+            let mut rows = qb.build().fetch(&mut *conn);
             while let Some(row) = rows.next().await {
                 let row = row?;
-                let event_id: Option<i64> = row.get(0);
-                epoch_id = row.get(2);
-                if let Some(event_id) = event_id {
-                    let payload = self.serde.deserialize(row.get(1))?;
-                    let payload: QE = payload
-                        .try_into()
-                        .map_err(|e| Error::QueryEventMapping(Box::new(e)))?;
-                    yield Ok(StreamItem::Event(PersistedEvent::new(event_id, payload)));
-                }
+                let event_id: i64 = row.get(0);
+                let payload = self.serde.deserialize(row.get(1))?;
+                let payload: QE = payload
+                    .try_into()
+                    .map_err(|e| Error::QueryEventMapping(Box::new(e)))?;
+                yield Ok(StreamItem::Event(PersistedEvent::new(event_id, payload)));
             }
             yield Ok(StreamItem::End(epoch_id));
         }
