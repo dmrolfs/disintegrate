@@ -518,10 +518,14 @@ where
 
     /// Attempts to execute the event handling logic once, with error mapping and lock management.
     pub async fn try_execute(&self) -> Result<(), PgEventListenerError<L::Error>> {
+        // READ COMMITTED on purpose: the scan and the epoch are two statements, and the scan must see every commit
+        // the epoch covers. A transaction-wide snapshot (REPEATABLE READ or SERIALIZABLE, which a server default or a
+        // pool option can select) is taken at the first statement and would hide a writer that commits before the
+        // epoch is computed, so the checkpoint would move past an event the handler never saw.
         let mut tx = self
             .event_store
             .pool
-            .begin()
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await
             .map_err(|e| PgEventListenerError {
                 kind: PgEventListenerErrorKind::InitTransaction { source: e.into() },

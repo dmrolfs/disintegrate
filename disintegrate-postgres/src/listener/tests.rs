@@ -266,3 +266,170 @@ async fn it_runs_event_listener_with_db_listener(pool: PgPool) {
     assert_eq!("product_1", &first_row.product_id);
     assert_eq!(1, first_row.quantity);
 }
+
+const EPOCH_GATE: i64 = 4343;
+
+/// Re-creates `event_store_current_epoch()` with one extra line that waits on a gate, so a reader can be parked
+/// after its transaction's snapshot exists and before it computes the epoch.
+async fn park_epoch_function(pool: &PgPool) {
+    let body: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('event_store_current_epoch()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let gated = body.replacen(
+        "BEGIN\n",
+        &format!("BEGIN\n    PERFORM pg_advisory_xact_lock({EPOCH_GATE});\n"),
+        1,
+    );
+    assert_ne!(gated, body, "the gate line must have been inserted");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(gated))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn wait_until_epoch_parked(pool: &PgPool) {
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND objid = $1",
+        )
+        .bind(EPOCH_GATE as i32)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the listener never reached the epoch function");
+}
+
+/// A writer that has marked its append and inserted one cart event, and has not committed. It uses plain SQL rather
+/// than the library's append, so two overlapping writers do not abort each other with serialization failures.
+async fn open_writer(pool: &PgPool, cart: &str) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT event_store_begin_epoch()")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let payload = serde_json::to_vec(&ShoppingCartEvent::Added(CartEventPayload {
+        cart_id: cart.to_string(),
+        product_id: "product_1".to_string(),
+        quantity: 1,
+    }))
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO event (event_type, payload, cart_id, product_id) VALUES ('ShoppingCartAdded', $1, $2, 'product_1')",
+    )
+    .bind(payload)
+    .bind(cart)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx
+}
+
+/// Writer A draws id 1 and stays open; writer B draws id 2 and commits. The listener's transaction then starts and
+/// takes its snapshot (it sees event 2 only), parks before it computes the epoch, A commits, and the listener goes
+/// on. The epoch covers event 1 (A's marker is gone) and the snapshot's own maximum is 2. Returns the checkpoint and
+/// the number of cart rows the handler wrote.
+async fn pass_with_earlier_writer_committing_after_the_snapshot(
+    pool: &PgPool,
+    isolation: &str,
+) -> (i64, i64) {
+    let options = pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .options([("default_transaction_isolation", isolation)]);
+    let listener_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let store = PgEventStore::<ShoppingCartEvent, Json<ShoppingCartEvent>>::try_new(
+        listener_pool.clone(),
+        Json::default(),
+    )
+    .await
+    .unwrap();
+    let executor = PgEventListerExecutor::new(
+        store.clone(),
+        CartEventHandler::new(pool.clone()).await.unwrap(),
+        CancellationToken::new(),
+        PgEventListenerConfig::poller(Duration::from_secs(1)),
+    );
+    Migrator::new(store.clone()).init_listener().await.unwrap();
+    executor.init().await.unwrap();
+
+    let writer_a = open_writer(pool, "cart_1").await;
+    let writer_b = open_writer(pool, "cart_2").await;
+    writer_b.commit().await.unwrap();
+    // Last, because creating a store re-runs the migrations that define the epoch function.
+    park_epoch_function(pool).await;
+
+    let mut gate = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(EPOCH_GATE)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let pass = tokio::spawn(async move { executor.try_execute().await.unwrap() });
+    for _ in 0..40 {
+        assert!(
+            !pass.is_finished(),
+            "the listener pass ended before it reached the epoch function"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    wait_until_epoch_parked(pool).await;
+
+    writer_a.commit().await.unwrap();
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(EPOCH_GATE)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), pass)
+        .await
+        .expect("the listener pass did not finish")
+        .unwrap();
+
+    let checkpoint: i64 =
+        sqlx::query_scalar("SELECT last_processed_event_id FROM event_listener WHERE id = 'carts'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let rows = Cart::carts(pool).await.unwrap().len() as i64;
+    eprintln!("{isolation}: checkpoint {checkpoint}, rows {rows}");
+    (checkpoint, rows)
+}
+
+/// Every event up to the checkpoint has been handled. Event ids here have no gaps, so that is rows == checkpoint.
+fn assert_no_skip(isolation: &str, (checkpoint, rows): (i64, i64)) {
+    assert_eq!(
+        rows, checkpoint,
+        "{isolation}: the checkpoint {checkpoint} covers events whose handler never ran (rows {rows})"
+    );
+}
+
+#[sqlx::test]
+async fn an_earlier_writer_committing_after_the_snapshot_is_not_skipped_at_read_committed(pool: PgPool) {
+    let r = pass_with_earlier_writer_committing_after_the_snapshot(&pool, "read committed").await;
+    assert_no_skip("read committed", r);
+}
+
+#[sqlx::test]
+async fn an_earlier_writer_committing_after_the_snapshot_is_not_skipped_at_repeatable_read(pool: PgPool) {
+    let r = pass_with_earlier_writer_committing_after_the_snapshot(&pool, "repeatable read").await;
+    assert_no_skip("repeatable read", r);
+}
+
+#[sqlx::test]
+async fn an_earlier_writer_committing_after_the_snapshot_is_not_skipped_at_serializable(pool: PgPool) {
+    let r = pass_with_earlier_writer_committing_after_the_snapshot(&pool, "serializable").await;
+    assert_no_skip("serializable", r);
+}
